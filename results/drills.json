@@ -1,0 +1,39 @@
+{
+  "crash_storm": {
+    "drill": "crash_storm",
+    "jobs_enqueued": 1500,
+    "poison_messages_planted": 24,
+    "worker_kills_injected": 699,
+    "wall_s": 35.83,
+    "jobs_per_s": 41.9,
+    "distinct_effects_applied": 1476,
+    "expected_effects": 1476,
+    "effects_applied_more_than_once": 0,
+    "effects_missing": 0,
+    "dead_lettered": 24,
+    "jobs_left_unfinished": 0,
+    "queue_stats": {
+      "by_state": {
+        "dead": 24,
+        "succeeded": 1476
+      },
+      "queue_depth": 0,
+      "in_flight": 0,
+      "dead_letters": 24,
+      "side_effects": 1476,
+      "age_of_oldest_ready_s": 0.0
+    },
+    "passed": true,
+    "claim": "at-least-once DELIVERY with exactly-once EFFECTS: 699 worker kills, 1476 effects applied exactly once, 0 applied twice"
+  },
+  "dlq_replay": {
+    "drill": "dlq_replay",
+    "jobs": 50,
+    "dead_lettered": 50,
+    "replayed": 50,
+    "distinct_effects": 50,
+    "effects_applied_twice": 0,
+    "passed": true,
+    "note": "a replayed job keeps its ORIGINAL dedup key, so replay is not a second chance to double-charge someone"
+  }
+}
