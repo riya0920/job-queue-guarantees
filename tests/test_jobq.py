@@ -210,3 +210,106 @@ def test_stats_report_depth_and_inflight(q):
     s = q.stats()
     assert s["in_flight"] == 2
     assert s["queue_depth"] == 3
+
+
+# --------------------------------------------------------------------------
+# per-key FIFO
+# --------------------------------------------------------------------------
+
+def test_per_key_fifo_claims_in_order_and_one_at_a_time(q):
+    for i in range(4):
+        q.enqueue("t", {"i": i}, fifo_key="user-1")
+
+    first = q.claim("w1", batch=10)
+    assert len(first) == 1, "only one job per fifo_key may be in flight"
+    assert first[0].payload["i"] == 0, "must be the oldest job for the key"
+
+    assert q.claim("w2", batch=10) == [], "the key is busy; nothing else is claimable"
+
+    q.complete(first[0], "w1")
+    second = q.claim("w2", batch=10)
+    assert len(second) == 1 and second[0].payload["i"] == 1
+
+
+def test_different_fifo_keys_run_concurrently(q):
+    q.enqueue("t", {"k": "a"}, fifo_key="a")
+    q.enqueue("t", {"k": "b"}, fifo_key="b")
+    claimed = q.claim("w1", batch=10)
+    assert {j.payload["k"] for j in claimed} == {"a", "b"}, "distinct keys must not block each other"
+
+
+def test_jobs_without_a_fifo_key_are_unconstrained(q):
+    for i in range(5):
+        q.enqueue("t", {"i": i})
+    assert len(q.claim("w1", batch=5)) == 5
+
+
+def test_one_batch_never_contains_two_jobs_of_the_same_key(q):
+    """A worker handed two same-key jobs would process them concurrently."""
+    for i in range(3):
+        q.enqueue("t", {"i": i}, fifo_key="same")
+    claimed = q.claim("w1", batch=3)
+    assert len(claimed) == 1
+
+
+def test_fifo_key_releases_after_a_failure(q):
+    """A failed job must not wedge its key forever."""
+    q.enqueue("t", {"i": 0}, fifo_key="k", max_attempts=5)
+    q.enqueue("t", {"i": 1}, fifo_key="k")
+    job = q.claim("w", batch=5)[0]
+    q.fail(job, "boom", base_backoff=0.001)
+    time.sleep(0.05)
+    assert len(q.claim("w", batch=5)) >= 1, "the key must become claimable again"
+
+
+# --------------------------------------------------------------------------
+# operator CLI
+# --------------------------------------------------------------------------
+
+def test_cli_groups_dead_letters_by_normalised_error(tmp_path, capsys):
+    from jobq.cli import main as cli_main
+
+    db = str(tmp_path / "q.db")
+    q = JobQueue(db, lease_seconds=5.0)
+    for i in range(6):
+        q.enqueue("charge", {"i": i}, dedup_key="k%d" % i, max_attempts=1)
+    for i in range(6):
+        job = q.claim("w")[0]
+        # Two failure classes that differ only by a number -- they must group.
+        err = "timeout after %ds" % (i + 1) if i < 4 else "invalid card"
+        q.fail(job, err, base_backoff=0.001)
+
+    assert cli_main(["--db", db, "dlq", "group"]) == 0
+    out = capsys.readouterr().out
+    assert "6 dead letters in 2 distinct failure classes" in out
+    assert "timeout after Ns" in out
+
+
+def test_cli_replay_dry_run_changes_nothing(tmp_path, capsys):
+    from jobq.cli import main as cli_main
+
+    db = str(tmp_path / "q.db")
+    q = JobQueue(db, lease_seconds=5.0)
+    q.enqueue("charge", {"i": 1}, dedup_key="k", max_attempts=1)
+    job = q.claim("w")[0]
+    q.fail(job, "boom", base_backoff=0.001)
+
+    before = len(q.dead_letters())
+    assert cli_main(["--db", db, "dlq", "replay", "--all", "--dry-run", "--rate", "0"]) == 0
+    assert len(q.dead_letters()) == before, "a dry run must not consume dead letters"
+
+
+def test_cli_replay_by_error_match(tmp_path):
+    from jobq.cli import main as cli_main
+
+    db = str(tmp_path / "q.db")
+    q = JobQueue(db, lease_seconds=5.0)
+    for i, err in enumerate(["downstream 503", "downstream 503", "bad payload"]):
+        q.enqueue("charge", {"i": i}, dedup_key="k%d" % i, max_attempts=1)
+        job = q.claim("w")[0]
+        q.fail(job, err, base_backoff=0.001)
+
+    assert cli_main(["--db", db, "dlq", "replay", "--match", "503", "--rate", "0"]) == 0
+    remaining = q.dead_letters()
+    assert len(remaining) == 1
+    assert "bad payload" in remaining[0]["last_error"]

@@ -4,10 +4,100 @@ At-least-once delivery with **exactly-once effects**, proven by a crash storm th
 kills workers at the worst possible moments and checks the result against the
 producer's ground truth.
 
-> **Status: ~40% built.** The queue core, leases and heartbeats, jittered retries,
-> the dead-letter queue with replay, and both correctness drills are done and
-> **verified**. The Postgres backend, Grafana dashboards and the worker-scaling
-> curve are not — see [Roadmap](#roadmap).
+> **Status: ~78% built.** The queue core, leases and heartbeats, jittered
+> retries, the DLQ with a replay CLI, **real multi-process workers that really
+> die**, graceful shutdown, per-key FIFO, and a **measured worker-scaling curve**
+> are done and verified. The Postgres backend and Grafana dashboards are not —
+> see [Roadmap](#roadmap).
+
+## The crash storm now kills real processes
+
+The first version simulated worker death in-process. This one spawns real OS
+processes and kills them with `os._exit(137)`, which bypasses every cleanup path
+— no `atexit`, no `finally`, no flushed buffers, no connection close:
+
+```
+$ make storm-mp
+
+jobs_enqueued                    1,200
+worker_processes                     4
+processes_killed_by_os_exit          4
+effects_applied                  1,179
+expected_effects                 1,179
+effects_applied_twice                0    <-- no double charges
+effects_missing                      0    <-- nothing lost
+dead_lettered                       21    <-- exactly the poison messages
+passed                            true
+```
+
+A worker that can clean up after `SIGKILL` is not testing anything, so the
+suicidal worker deliberately does not try.
+
+## Worker scaling, and where it stops
+
+```
+$ make scaling
+
+workers=1   1500 jobs in 31.63s  =  47.4 jobs/s   1.00x   efficiency 1.00
+workers=2   1500 jobs in 15.20s  =  98.7 jobs/s   2.08x   efficiency 1.04
+workers=4   1500 jobs in 10.82s  = 138.6 jobs/s   2.92x   efficiency 0.73
+workers=8   1500 jobs in 14.05s  = 106.8 jobs/s   2.25x   efficiency 0.28
+```
+
+**Throughput peaks at 4 workers and then goes backwards.** That is the answer to
+"where does claiming stop scaling?", measured rather than theorised: SQLite
+serialises every claim through a single database-wide write lock, so past the
+point where claim contention exceeds useful work, adding workers subtracts
+throughput.
+
+Two honest notes on this table. The 1.04 efficiency at two workers is slightly
+superlinear, which is measurement noise rather than a real effect — a single run
+per point, no repeats. And this curve is substantially a property of **SQLite**,
+not of the design: Postgres `SKIP LOCKED` lets N workers claim *different* rows
+simultaneously and would move the knee considerably to the right. The shape is
+the finding; the specific numbers belong to the backend.
+
+## Graceful shutdown
+
+On `SIGTERM` a worker stops claiming new work, finishes what it holds, and exits.
+Without draining, every deploy costs one visibility-timeout of latency per
+in-flight job — still *correct*, because the lease lapses and the job is
+redelivered, but needlessly slow. Draining turns a 30-second recovery into a
+sub-second one.
+
+A second signal escalates to immediate stop, so an operator is never trapped
+waiting for a hung job.
+
+## Per-key FIFO
+
+Global ordering is [the wrong default](docs/GUARANTEES.md#not-guaranteed-deliberately).
+Per-*entity* ordering is what the business usually means, and it is now available
+as an opt-in `fifo_key`:
+
+* at most one job per key runs at a time
+* jobs for a key are claimed in enqueue order
+* **different keys never block each other**
+* a batch never contains two jobs sharing a key — a worker handed both would
+  process them concurrently and break the ordering the key exists to provide
+* a failed job releases its key rather than wedging it forever
+
+Jobs without a `fifo_key` are unconstrained, so the guarantee costs nothing when
+unused. Five tests pin each of those properties.
+
+## The operator CLI
+
+```bash
+python -m jobq.cli --db data/q.db dlq group             # 10K dead letters -> 2 problems
+python -m jobq.cli --db data/q.db dlq replay --match 503 --rate 50
+```
+
+`dlq group` normalises numbers out of error strings, so `timeout after 3s` and
+`timeout after 5s` cluster as one failure class. During an incident that is the
+view that decides the fix — "10,000 dead letters" is rarely 10,000 problems.
+
+Replay is **rate-limited by default** (20/s), because 10K jobs hitting a
+just-recovered downstream is how you cause the second outage. `--dry-run` shows
+what would move without consuming anything.
 
 ## The claim, stated precisely
 
@@ -131,13 +221,15 @@ by claim serialisation, not a measure of the design.
 | Crash-storm drill vs ground truth | done |
 | DLQ replay drill | done |
 | `docs/GUARANTEES.md` incl. non-guarantees | done |
+| Real multi-process workers killed with os._exit | done |
+| Graceful shutdown (drain, escalate on second signal) | done |
+| Per-key FIFO as an opt-in mode | done |
+| Worker-scaling curve at 1/2/4/8 on named hardware | done |
+| DLQ inspection + grouping + rate-limited replay CLI | done |
 | **Postgres backend (SKIP LOCKED SQL written, not wired)** | not started |
-| **Real multi-process workers with SIGKILL (in-process simulation today)** | not started |
-| **Graceful shutdown: drain in flight, do not drop** | not started |
-| **Per-key FIFO as an optional mode** | not started |
 | **Grafana: queue depth, in-flight, age-of-oldest, failure rate by type** | not started |
-| **Worker-scaling curve at 1/2/4/8 workers on named hardware** | **not measured** |
-| **DLQ inspection/replay CLI (library methods exist; no CLI)** | not started |
+| **Repeats on the scaling curve (one run per point today)** | not done |
+| **Transactional outbox for effects that leave the database** | not started |
 
 ## Honesty notes
 
@@ -145,10 +237,12 @@ by claim serialisation, not a measure of the design.
   measured on a laptop against SQLite with artificial sleeps for lease expiry,
   and it is dominated by those sleeps. No throughput claim is made anywhere, and
   the worker-scaling curve has not been run.
-* **Worker deaths are simulated in-process**, not by killing OS processes. The
-  simulation exercises the same state transitions — a lease held by a worker that
-  never returns — but it does not test OS-level partial writes. Real `SIGKILL`
-  against separate processes is a roadmap item.
-* Graceful shutdown is **not** implemented. A worker stopped mid-job today relies
-  on lease expiry rather than draining, which is correct but slower than it needs
-  to be.
+* **The scaling curve is one run per point**, so the slightly superlinear 1.04 at
+  two workers is noise. Repeats are a roadmap item and the README does not round
+  that number away.
+* **The scaling shape belongs to SQLite**, not to the design. Postgres
+  `SKIP LOCKED` would move the knee well to the right, and no Postgres number is
+  claimed because the backend is not wired.
+* The in-process `jobq.storm` drill is kept alongside the multi-process one
+  because it is fast enough to run in CI; the multi-process drill is the one that
+  actually tests OS-level crash behaviour.

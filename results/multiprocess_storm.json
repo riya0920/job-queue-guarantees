@@ -1,0 +1,17 @@
+{
+  "drill": "multiprocess_crash_storm",
+  "jobs_enqueued": 1200,
+  "worker_processes": 4,
+  "processes_killed_by_os_exit": 4,
+  "kill_probability": 0.15,
+  "poison_planted": 21,
+  "wall_s": 9.5,
+  "effects_applied": 1179,
+  "expected_effects": 1179,
+  "effects_applied_twice": 0,
+  "effects_missing": 0,
+  "dead_lettered": 21,
+  "jobs_unfinished": 0,
+  "passed": true,
+  "claim": "real OS processes killed with os._exit(137), bypassing every cleanup path: 1179 effects applied exactly once, 0 twice, 0 lost"
+}

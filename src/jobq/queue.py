@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_type         TEXT NOT NULL,
     payload          TEXT NOT NULL,
     dedup_key        TEXT,
+    -- Optional per-key ordering. When set, at most one job per fifo_key may be
+    -- running at a time and they are claimed in enqueue order. This is the RIGHT
+    -- ordering primitive: global ordering forces a single consumer and lets one
+    -- slow job block every unrelated job, whereas per-entity ordering is what
+    -- the business almost always actually means.
+    fifo_key         TEXT,
     state            TEXT NOT NULL DEFAULT 'ready',   -- ready|running|succeeded|dead
     priority         INTEGER NOT NULL DEFAULT 0,
     attempts         INTEGER NOT NULL DEFAULT 0,
@@ -99,6 +105,7 @@ CREATE TABLE IF NOT EXISTS dead_letters (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_claimable ON jobs(state, run_after, priority);
+CREATE INDEX IF NOT EXISTS idx_jobs_fifo ON jobs(fifo_key, state, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_lease ON jobs(state, lease_expires_at);
 """
 
@@ -122,14 +129,15 @@ class JobQueue:
     # -- producing ---------------------------------------------------------
 
     def enqueue(self, job_type: str, payload: dict, dedup_key: str | None = None,
-                priority: int = 0, delay_seconds: float = 0.0, max_attempts: int = 5) -> int:
+                priority: int = 0, delay_seconds: float = 0.0, max_attempts: int = 5,
+                fifo_key: str | None = None) -> int:
         now = self._clock()
         con = self._connect()
         try:
             cur = con.execute(
-                "INSERT INTO jobs (job_type, payload, dedup_key, state, priority, max_attempts,"
-                " run_after, created_at, updated_at) VALUES (?,?,?,'ready',?,?,?,?,?)",
-                (job_type, json.dumps(payload), dedup_key, priority, max_attempts,
+                "INSERT INTO jobs (job_type, payload, dedup_key, fifo_key, state, priority,"
+                " max_attempts, run_after, created_at, updated_at) VALUES (?,?,?,?,'ready',?,?,?,?,?)",
+                (job_type, json.dumps(payload), dedup_key, fifo_key, priority, max_attempts,
                  now + delay_seconds, now, now),
             )
             return cur.lastrowid
@@ -164,15 +172,35 @@ class JobQueue:
                 (now, now),
             )
 
+            # Per-key FIFO: a job with a fifo_key is claimable only if no other
+            # job with the same key is running, and only if it is the OLDEST
+            # ready job for that key. Jobs without a fifo_key are unconstrained,
+            # so the ordering guarantee is opt-in and costs nothing by default.
             rows = con.execute(
-                "SELECT id, job_type, payload, attempts, dedup_key FROM jobs"
-                " WHERE state='ready' AND run_after <= ?"
-                " ORDER BY priority DESC, run_after ASC, id ASC LIMIT ?",
-                (now, batch),
+                "SELECT j.id, j.job_type, j.payload, j.attempts, j.dedup_key FROM jobs j"
+                " WHERE j.state='ready' AND j.run_after <= ?"
+                "   AND (j.fifo_key IS NULL OR ("
+                "        NOT EXISTS (SELECT 1 FROM jobs r"
+                "                    WHERE r.fifo_key = j.fifo_key AND r.state='running')"
+                "    AND j.id = (SELECT MIN(o.id) FROM jobs o"
+                "                WHERE o.fifo_key = j.fifo_key AND o.state='ready'"
+                "                  AND o.run_after <= ?)))"
+                " ORDER BY j.priority DESC, j.run_after ASC, j.id ASC LIMIT ?",
+                (now, now, batch),
             ).fetchall()
+
+            # Within one batch, never hand the same worker two jobs sharing a
+            # fifo_key -- it would process them concurrently and break the order
+            # the key exists to guarantee.
+            seen_keys = set()
 
             claimed = []
             for job_id, job_type, payload, attempts, dedup_key in rows:
+                key = con.execute("SELECT fifo_key FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+                if key is not None:
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
                 con.execute(
                     "UPDATE jobs SET state='running', attempts=attempts+1, claimed_by=?,"
                     " lease_expires_at=?, updated_at=? WHERE id=?",

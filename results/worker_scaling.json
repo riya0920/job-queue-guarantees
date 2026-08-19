@@ -1,0 +1,50 @@
+{
+  "benchmark": "worker_scaling",
+  "jobs_per_run": 1500,
+  "per_job_work_s": 0.002,
+  "lease_s": 1.5,
+  "hardware": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 126 Stepping 5, GenuineIntel",
+    "cpu_count": 8
+  },
+  "rows": [
+    {
+      "workers": 1,
+      "jobs_completed": 1500,
+      "wall_s": 31.63,
+      "jobs_per_s": 47.4,
+      "speedup": 1.0,
+      "ideal": 1.0,
+      "efficiency": 1.0
+    },
+    {
+      "workers": 2,
+      "jobs_completed": 1500,
+      "wall_s": 15.2,
+      "jobs_per_s": 98.7,
+      "speedup": 2.08,
+      "ideal": 2.0,
+      "efficiency": 1.04
+    },
+    {
+      "workers": 4,
+      "jobs_completed": 1500,
+      "wall_s": 10.82,
+      "jobs_per_s": 138.6,
+      "speedup": 2.92,
+      "ideal": 4.0,
+      "efficiency": 0.73
+    },
+    {
+      "workers": 8,
+      "jobs_completed": 1500,
+      "wall_s": 14.05,
+      "jobs_per_s": 106.8,
+      "speedup": 2.25,
+      "ideal": 8.0,
+      "efficiency": 0.281
+    }
+  ],
+  "caveat": "SQLite serialises claims through a single write lock, so this curve measures that contention as much as it measures parallelism. Postgres SKIP LOCKED lets N workers claim different rows simultaneously and would change the shape."
+}
