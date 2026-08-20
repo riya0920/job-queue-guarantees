@@ -313,3 +313,126 @@ def test_cli_replay_by_error_match(tmp_path):
     remaining = q.dead_letters()
     assert len(remaining) == 1
     assert "bad payload" in remaining[0]["last_error"]
+
+
+# --------------------------------------------------------------------------
+# transactional outbox -- effects that leave the database
+# --------------------------------------------------------------------------
+
+def test_completion_and_outbound_intent_commit_together(q):
+    from jobq.outbox import Outbox, complete_with_outbox
+
+    ob = Outbox(q)
+    q.enqueue("charge", {"amount": 10}, dedup_key="k1")
+    job = q.claim("w")[0]
+    assert complete_with_outbox(q, job, "w", {"ok": 1}, destination="payments",
+                                outbound_payload={"amount": 10}) == "applied"
+
+    assert q.stats()["side_effects"] == 1
+    assert ob.stats()["pending"] == 1
+
+
+def test_a_crash_before_commit_stages_nothing(q):
+    """Neither the completion nor the intent may survive a failed transaction."""
+    from jobq.outbox import Outbox, complete_with_outbox
+
+    ob = Outbox(q)
+    q.enqueue("charge", {"amount": 10}, dedup_key="k1")
+    job = q.claim("w")[0]
+
+    real_connect = q._connect
+
+    class ExplodingConnection:
+        def __init__(self, inner):
+            self.inner = inner
+            self.calls = 0
+
+        def execute(self, sql, *a):
+            self.calls += 1
+            # Blow up at the final COMMIT, after everything is staged.
+            if sql.strip().upper().startswith("COMMIT"):
+                raise RuntimeError("process died before commit")
+            return self.inner.execute(sql, *a)
+
+        def close(self):
+            self.inner.close()
+
+    q._connect = lambda: ExplodingConnection(real_connect())
+    with pytest.raises(RuntimeError):
+        complete_with_outbox(q, job, "w", {"ok": 1}, destination="payments",
+                             outbound_payload={"amount": 10})
+    q._connect = real_connect
+
+    assert q.stats()["side_effects"] == 0, "the effect must not exist"
+    assert ob.stats()["total"] == 0, "the outbound intent must not exist either"
+
+
+def test_relay_delivers_and_marks_delivered(q):
+    from jobq.outbox import Outbox, complete_with_outbox
+
+    ob = Outbox(q)
+    for i in range(3):
+        q.enqueue("charge", {"amount": i}, dedup_key="k%d" % i)
+        job = q.claim("w")[0]
+        complete_with_outbox(q, job, "w", destination="payments",
+                             outbound_payload={"amount": i})
+
+    seen = []
+    counts = ob.relay_once(lambda e: seen.append(e["idempotency_key"]))
+    assert counts["delivered"] == 3
+    assert ob.stats()["pending"] == 0
+    assert len(set(seen)) == 3, "each entry carries a distinct idempotency key"
+
+
+def test_the_relay_passes_an_idempotency_key_to_the_remote_side(q):
+    """At-least-once delivery is only safe if the far side can deduplicate."""
+    from jobq.outbox import Outbox, complete_with_outbox
+
+    ob = Outbox(q)
+    q.enqueue("charge", {"amount": 5}, dedup_key="stable-key")
+    job = q.claim("w")[0]
+    complete_with_outbox(q, job, "w", destination="payments", outbound_payload={"amount": 5})
+
+    captured = {}
+    ob.relay_once(lambda e: captured.update(e))
+    assert captured["idempotency_key"] == "stable-key"
+
+
+def test_a_failing_delivery_retries_then_dead_letters(q):
+    from jobq.outbox import Outbox, complete_with_outbox
+
+    ob = Outbox(q)
+    q.enqueue("charge", {"amount": 1}, dedup_key="doomed")
+    job = q.claim("w")[0]
+    complete_with_outbox(q, job, "w", destination="payments", outbound_payload={"amount": 1})
+    # Force every attempt to be due immediately.
+    con = q._connect()
+    con.execute("UPDATE outbox SET max_attempts = 3")
+    con.close()
+
+    def always_fails(entry):
+        raise ConnectionError("payment gateway down")
+
+    outcomes = []
+    for _ in range(3):
+        con = q._connect()
+        con.execute("UPDATE outbox SET next_attempt_at = 0 WHERE state='pending'")
+        con.close()
+        outcomes.append(ob.relay_once(always_fails))
+
+    assert ob.stats()["dead"] == 1
+    assert ob.stats()["pending"] == 0
+
+
+def test_staging_the_same_key_twice_is_a_no_op(q):
+    """The unique idempotency key is what stops a redelivered job double-staging."""
+    from jobq.outbox import Outbox, complete_with_outbox
+
+    ob = Outbox(q)
+    q.enqueue("charge", {"amount": 7}, dedup_key="same")
+    job = q.claim("w")[0]
+    complete_with_outbox(q, job, "w", destination="payments", outbound_payload={"amount": 7})
+    # A redelivery of the same job deduplicates and must not stage a second intent.
+    assert complete_with_outbox(q, job, "w", destination="payments",
+                                outbound_payload={"amount": 7}) == "deduplicated"
+    assert ob.stats()["total"] == 1

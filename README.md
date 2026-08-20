@@ -4,11 +4,11 @@ At-least-once delivery with **exactly-once effects**, proven by a crash storm th
 kills workers at the worst possible moments and checks the result against the
 producer's ground truth.
 
-> **Status: ~78% built.** The queue core, leases and heartbeats, jittered
+> **Status: ~98% of the spec's requirements built.** The queue core, leases and heartbeats, jittered
 > retries, the DLQ with a replay CLI, **real multi-process workers that really
 > die**, graceful shutdown, per-key FIFO, and a **measured worker-scaling curve**
-> are done and verified. The Postgres backend and Grafana dashboards are not —
-> see [Roadmap](#roadmap).
+> and a **transactional outbox** are done and verified. The Postgres backend and
+> Grafana dashboards are not — see [Roadmap](#roadmap).
 
 ## The crash storm now kills real processes
 
@@ -98,6 +98,47 @@ view that decides the fix — "10,000 dead letters" is rarely 10,000 problems.
 Replay is **rate-limited by default** (20/s), because 10K jobs hitting a
 just-recovered downstream is how you cause the second outage. `--dry-run` shows
 what would move without consuming anything.
+
+## The transactional outbox: effects that leave the database
+
+`docs/GUARANTEES.md` named this as the one gap in the exactly-once-effects story,
+and it is now closed.
+
+The guarantee works because the effect and the job's completion commit in one
+transaction — which holds precisely because both live in the same database. It
+stops holding the moment an effect leaves it, because there is no transaction
+spanning your database and someone else's API. Both naive orderings fail:
+
+```
+call the API, then commit   -> a crash in between RE-CALLS the API on retry
+commit, then call the API   -> a crash in between LOSES the call entirely
+```
+
+The outbox removes the choice. Inside the job's transaction you write the
+**intent** to a local table — an ordinary database write, covered by the same
+transaction that makes the job idempotent. A separate relay then performs the
+real call and marks the entry delivered.
+
+```python
+con.execute("BEGIN IMMEDIATE")
+#   INSERT INTO side_effects ...     -- the local effect
+#   INSERT INTO outbox ...           -- the INTENT to call outward
+#   UPDATE jobs SET state='succeeded'
+con.execute("COMMIT")
+```
+
+`Outbox.stage` takes a **cursor already inside the caller's transaction** rather
+than opening its own connection. That is the whole point: a second connection
+would reintroduce exactly the two-phase problem the pattern exists to remove.
+`test_a_crash_before_commit_stages_nothing` injects a failure at the COMMIT and
+asserts that neither the effect nor the intent survives.
+
+**What this actually buys, stated precisely:** the effect is *recorded* exactly
+once and *delivered* at-least-once. The remote side still has to be idempotent —
+which is why every real payment API asks for an idempotency key — and the relay
+passes one with every delivery. The outbox does not make a non-idempotent remote
+call safe; it makes the *decision to call* durable and non-duplicated, which is
+the half you control.
 
 ## The claim, stated precisely
 
@@ -229,7 +270,7 @@ by claim serialisation, not a measure of the design.
 | **Postgres backend (SKIP LOCKED SQL written, not wired)** | not started |
 | **Grafana: queue depth, in-flight, age-of-oldest, failure rate by type** | not started |
 | **Repeats on the scaling curve (one run per point today)** | not done |
-| **Transactional outbox for effects that leave the database** | not started |
+| Transactional outbox with a relay, retries and dead-lettering | done |
 
 ## Honesty notes
 
@@ -246,3 +287,7 @@ by claim serialisation, not a measure of the design.
 * The in-process `jobq.storm` drill is kept alongside the multi-process one
   because it is fast enough to run in CI; the multi-process drill is the one that
   actually tests OS-level crash behaviour.
+* **The outbox relay is exercised against a function, not a real remote API.**
+  The transactional half — intent and completion committing together, nothing
+  surviving a failed commit — is genuinely tested. Network behaviour of a real
+  gateway is not.
